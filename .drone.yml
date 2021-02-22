@@ -1,93 +1,542 @@
-pipeline:
+---
+kind: pipeline
+type: kubernetes
+name: matrix-1
 
-  synch_secrets:
-    image: quay.io/ukhomeofficedigital/cop-secrets
-    environment:
-      - DRONE_SERVER=https://drone.acp.homeoffice.gov.uk
-      - DEPLOY_ENV=dev
-    secrets:
-      - source: DEV_DRONE_AWS_ACCESS_KEY_ID
-        target: AWS_ACCESS_KEY_ID
-      - source: DEV_DRONE_AWS_SECRET_ACCESS_KEY
-        target: AWS_SECRET_ACCESS_KEY
-      - source: DRONE_PUBLIC_TOKEN
-        target: DRONE_TOKEN
-    when:
-      environment: secrets
-      event: deployment
-      matrix:
-        NODE_VERSION: 12
+platform:
+  os: linux
+  arch: amd64
 
-  build_matrix:
-    image: quay.io/ukhomeofficedigital/drone-docker
-    commands:
-      - docker build -t cop-node:$${TAG_NAME} -f Dockerfile-$${DOCKER_FILENAME} --build-arg NODE_TAG=$${NODE_VERSION} .
-    when:
-      event: push
+steps:
+- name: build_matrix
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+  commands:
+  - n=0; while [ "$n" -lt 60 ] && [ ! docker stats --no-stream ]; do n=$(( n + 1 )); sleep 1; done
+  - docker build -t cop-node:12-alpine -f Dockerfile-alpine --build-arg NODE_TAG=12-alpine .
+  when:
+    event:
+    - push
 
-  vulnerability_scan_matrix:
-    image: quay.io/ukhomeofficedigital/anchore-submission:latest
-    dockerfile: Dockerfile-${DOCKER_FILENAME}
-    image_name: cop-node:${TAG_NAME}
-    local_image: true
-    tolerate: low
-    fail_on_detection: false
-    when:
-      branch: master
-      event: push
+- name: vulnerability_scan_matrix
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/anchore-submission:latest
+  environment:
+    DOCKERFILE: Dockerfile-alpine
+    IMAGE_NAME: cop-node:12-alpine
+    LOCAL_IMAGE: true
+    TOLERATE: low
+    WHITELIST_FILE: whitelist
+  when:
+    branch:
+    - master
+    event:
+    - push
 
-  image_to_quay_matrix:
-    image: quay.io/ukhomeofficedigital/drone-docker
-    secrets:
-    - source: QUAY_USERNAME
-      target: DOCKER_USERNAME
-    - source: QUAY_PASSWORD
-      target: DOCKER_PASSWORD
-    commands:
-      - docker build --rm=true -f Dockerfile-$${DOCKER_FILENAME} -t cop-node:$${TAG_NAME} --build-arg NODE_TAG=$${NODE_VERSION} . --pull=true --label org.label-schema.schema-version=1.0 --label org.label-schema.build-date="$(date)" --label org.label-schema.vcs-ref=$${TAG_NAME} --label org.label-schema.vcs-url="https://github.com/UKHomeOffice/cop-node.git"
-      - docker tag cop-node:$${TAG_NAME} quay.io/ukhomeofficedigital/cop-node:$${TAG_NAME}
-      - echo $${DOCKER_PASSWORD} | docker login -u $${DOCKER_USERNAME} --password-stdin quay.io
-      - docker push quay.io/ukhomeofficedigital/cop-node:$${TAG_NAME}
-      - docker rmi cop-node:$${TAG_NAME}
-    when:
-      branch: master
-      event: push
+- name: image_to_quay_matrix
+  image: plugins/docker
+  commands:
+  - docker build --rm=true -f Dockerfile-alpine -t cop-node:12-alpine --build-arg NODE_TAG=12-alpine . --pull=true --label org.label-schema.schema-version=1.0 --label org.label-schema.build-date="$(date)" --label org.label-schema.vcs-ref=12-alpine --label org.label-schema.vcs-url="https://github.com/UKHomeOffice/cop-node.git"
+  - docker tag cop-node:12-alpine quay.io/ukhomeofficedigital/cop-node:12-alpine
+  - echo $${DOCKER_PASSWORD} | docker login -u $${DOCKER_USERNAME} --password-stdin quay.io
+  - docker push quay.io/ukhomeofficedigital/cop-node:12-alpine
+  - docker rmi cop-node:12-alpine
+  environment:
+    DOCKER_PASSWORD:
+      from_secret: QUAY_PASSWORD
+    DOCKER_USERNAME:
+      from_secret: QUAY_USERNAME
+  volumes:
+  - name: dockersock
+    path: /var/run
+  when:
+    branch:
+    - master
+    event:
+    - push
 
-  notify:
-    image: plugins/slack
-    secrets: [ SLACK_WEBHOOK ]
+- name: notify
+  pull: if-not-exists
+  image: plugins/slack
+  settings:
     channel: cop-deployments
+    template: "{{#build.deployTo}}\n  *{{repo.name}} - Build {{build.number}} - {{uppercasefirst build.deployTo}} - {{uppercase build.status}}*\n  {{build.link}}\n{{else}}\n  *{{repo.name}} - 12-alpine - Build {{build.number}} - Development - {{uppercase build.status}}*\n  {{build.link}}\n{{/build.deployTo}}\n"
     username: Drone Build Watcher
-    template: >
-      {{#build.deployTo}}
-        *{{repo.name}} - Build {{build.number}} - {{uppercasefirst build.deployTo}} - {{uppercase build.status}}*
-        {{build.link}}
-      {{else}}
-        *{{repo.name}} - ${TAG_NAME} - Build {{build.number}} - Development - {{uppercase build.status}}*
-        {{build.link}}
-      {{/build.deployTo}}
-    when:
-      branch: master
-      event: [ push, deployment ]
-      status: [ success, failure ]
+  environment:
+    SLACK_WEBHOOK:
+      from_secret: SLACK_WEBHOOK
+  when:
+    branch:
+    - master
+    event:
+    - push
+    - promote
+    status:
+    - success
+    - failure
 
-matrix:
-  include:
-    - DOCKER_FILENAME: alpine
-      NODE_VERSION: 12-alpine
-      TAG_NAME: 12-alpine
-    - DOCKER_FILENAME: stretch
-      NODE_VERSION: 11
-      TAG_NAME: 11
-    - DOCKER_FILENAME: alpine-python2
-      NODE_VERSION: 10-alpine
-      TAG_NAME: 10-alpine-python2
-    - DOCKER_FILENAME: stretch-python2
-      NODE_VERSION: 11
-      TAG_NAME: 11-python2
-    - DOCKER_FILENAME: amazonlinux-pdf
-      NODE_VERSION: 12
-      TAG_NAME: 12-amazonlinux
-    - DOCKER_FILENAME: stretch
-      NODE_VERSION: 13
-      TAG_NAME: 13
+services:
+- name: docker
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+
+- name: anchore-submission-server
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/anchore-submission:latest
+  commands:
+  - /run.sh server
+
+---
+kind: pipeline
+type: kubernetes
+name: matrix-2
+
+platform:
+  os: linux
+  arch: amd64
+
+steps:
+- name: build_matrix
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+  commands:
+  - n=0; while [ "$n" -lt 60 ] && [ ! docker stats --no-stream ]; do n=$(( n + 1 )); sleep 1; done
+  - docker build -t cop-node:11 -f Dockerfile-stretch --build-arg NODE_TAG=11 .
+  when:
+    event:
+    - push
+
+- name: vulnerability_scan_matrix
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/anchore-submission:latest
+  environment:
+    DOCKERFILE: Dockerfile-stretch
+    IMAGE_NAME: cop-node:11
+    LOCAL_IMAGE: true
+    TOLERATE: low
+    WHITELIST_FILE: whitelist
+  when:
+    branch:
+    - master
+    event:
+    - push
+
+- name: image_to_quay_matrix
+  image: plugins/docker
+  commands:
+  - docker build --rm=true -f Dockerfile-stretch -t cop-node:11 --build-arg NODE_TAG=11 . --pull=true --label org.label-schema.schema-version=1.0 --label org.label-schema.build-date="$(date)" --label org.label-schema.vcs-ref=11 --label org.label-schema.vcs-url="https://github.com/UKHomeOffice/cop-node.git"
+  - docker tag cop-node:11 quay.io/ukhomeofficedigital/cop-node:11
+  - echo $${DOCKER_PASSWORD} | docker login -u $${DOCKER_USERNAME} --password-stdin quay.io
+  - docker push quay.io/ukhomeofficedigital/cop-node:11
+  - docker rmi cop-node:11
+  environment:
+    DOCKER_PASSWORD:
+      from_secret: QUAY_PASSWORD
+    DOCKER_USERNAME:
+      from_secret: QUAY_USERNAME
+  volumes:
+  - name: dockersock
+    path: /var/run
+  when:
+    branch:
+    - master
+    event:
+    - push
+
+- name: notify
+  pull: if-not-exists
+  image: plugins/slack
+  settings:
+    channel: cop-deployments
+    template: "{{#build.deployTo}}\n  *{{repo.name}} - Build {{build.number}} - {{uppercasefirst build.deployTo}} - {{uppercase build.status}}*\n  {{build.link}}\n{{else}}\n  *{{repo.name}} - 11 - Build {{build.number}} - Development - {{uppercase build.status}}*\n  {{build.link}}\n{{/build.deployTo}}\n"
+    username: Drone Build Watcher
+  environment:
+    SLACK_WEBHOOK:
+      from_secret: SLACK_WEBHOOK
+  when:
+    branch:
+    - master
+    event:
+    - push
+    - promote
+    status:
+    - success
+    - failure
+
+services:
+- name: docker
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+
+- name: anchore-submission-server
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/anchore-submission:latest
+  commands:
+  - /run.sh server
+
+---
+kind: pipeline
+type: kubernetes
+name: matrix-3
+
+platform:
+  os: linux
+  arch: amd64
+
+steps:
+- name: build_matrix
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+  commands:
+  - n=0; while [ "$n" -lt 60 ] && [ ! docker stats --no-stream ]; do n=$(( n + 1 )); sleep 1; done
+  - docker build -t cop-node:10-alpine-python2 -f Dockerfile-alpine-python2 --build-arg NODE_TAG=10-alpine .
+  when:
+    event:
+    - push
+
+- name: vulnerability_scan_matrix
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/anchore-submission:latest
+  environment:
+    DOCKERFILE: Dockerfile-alpine-python2
+    IMAGE_NAME: cop-node:10-alpine-python2
+    LOCAL_IMAGE: true
+    TOLERATE: low
+    WHITELIST_FILE: whitelist
+  when:
+    branch:
+    - master
+    event:
+    - push
+
+- name: image_to_quay_matrix
+  image: plugins/docker
+  commands:
+  - docker build --rm=true -f Dockerfile-alpine-python2 -t cop-node:10-alpine-python2 --build-arg NODE_TAG=10-alpine . --pull=true --label org.label-schema.schema-version=1.0 --label org.label-schema.build-date="$(date)" --label org.label-schema.vcs-ref=10-alpine-python2 --label org.label-schema.vcs-url="https://github.com/UKHomeOffice/cop-node.git"
+  - docker tag cop-node:10-alpine-python2 quay.io/ukhomeofficedigital/cop-node:10-alpine-python2
+  - echo $${DOCKER_PASSWORD} | docker login -u $${DOCKER_USERNAME} --password-stdin quay.io
+  - docker push quay.io/ukhomeofficedigital/cop-node:10-alpine-python2
+  - docker rmi cop-node:10-alpine-python2
+  environment:
+    DOCKER_PASSWORD:
+      from_secret: QUAY_PASSWORD
+    DOCKER_USERNAME:
+      from_secret: QUAY_USERNAME
+  volumes:
+  - name: dockersock
+    path: /var/run
+  when:
+    branch:
+    - master
+    event:
+    - push
+
+- name: notify
+  pull: if-not-exists
+  image: plugins/slack
+  settings:
+    channel: cop-deployments
+    template: "{{#build.deployTo}}\n  *{{repo.name}} - Build {{build.number}} - {{uppercasefirst build.deployTo}} - {{uppercase build.status}}*\n  {{build.link}}\n{{else}}\n  *{{repo.name}} - 10-alpine-python2 - Build {{build.number}} - Development - {{uppercase build.status}}*\n  {{build.link}}\n{{/build.deployTo}}\n"
+    username: Drone Build Watcher
+  environment:
+    SLACK_WEBHOOK:
+      from_secret: SLACK_WEBHOOK
+  when:
+    branch:
+    - master
+    event:
+    - push
+    - promote
+    status:
+    - success
+    - failure
+
+services:
+- name: docker
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+
+- name: anchore-submission-server
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/anchore-submission:latest
+  commands:
+  - /run.sh server
+
+---
+kind: pipeline
+type: kubernetes
+name: matrix-4
+
+platform:
+  os: linux
+  arch: amd64
+
+steps:
+- name: build_matrix
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+  commands:
+  - n=0; while [ "$n" -lt 60 ] && [ ! docker stats --no-stream ]; do n=$(( n + 1 )); sleep 1; done
+  - docker build -t cop-node:11-python2 -f Dockerfile-stretch-python2 --build-arg NODE_TAG=11 .
+  when:
+    event:
+    - push
+
+- name: vulnerability_scan_matrix
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/anchore-submission:latest
+  environment:
+    DOCKERFILE: Dockerfile-stretch-python2
+    IMAGE_NAME: cop-node:11-python2
+    LOCAL_IMAGE: true
+    TOLERATE: low
+    WHITELIST_FILE: whitelist
+  when:
+    branch:
+    - master
+    event:
+    - push
+
+- name: image_to_quay_matrix
+  image: plugins/docker
+  commands:
+  - docker build --rm=true -f Dockerfile-stretch-python2 -t cop-node:11-python2 --build-arg NODE_TAG=11 . --pull=true --label org.label-schema.schema-version=1.0 --label org.label-schema.build-date="$(date)" --label org.label-schema.vcs-ref=11-python2 --label org.label-schema.vcs-url="https://github.com/UKHomeOffice/cop-node.git"
+  - docker tag cop-node:11-python2 quay.io/ukhomeofficedigital/cop-node:11-python2
+  - echo $${DOCKER_PASSWORD} | docker login -u $${DOCKER_USERNAME} --password-stdin quay.io
+  - docker push quay.io/ukhomeofficedigital/cop-node:11-python2
+  - docker rmi cop-node:11-python2
+  environment:
+    DOCKER_PASSWORD:
+      from_secret: QUAY_PASSWORD
+    DOCKER_USERNAME:
+      from_secret: QUAY_USERNAME
+  volumes:
+  - name: dockersock
+    path: /var/run
+  when:
+    branch:
+    - master
+    event:
+    - push
+
+- name: notify
+  pull: if-not-exists
+  image: plugins/slack
+  settings:
+    channel: cop-deployments
+    template: "{{#build.deployTo}}\n  *{{repo.name}} - Build {{build.number}} - {{uppercasefirst build.deployTo}} - {{uppercase build.status}}*\n  {{build.link}}\n{{else}}\n  *{{repo.name}} - 11-python2 - Build {{build.number}} - Development - {{uppercase build.status}}*\n  {{build.link}}\n{{/build.deployTo}}\n"
+    username: Drone Build Watcher
+  environment:
+    SLACK_WEBHOOK:
+      from_secret: SLACK_WEBHOOK
+  when:
+    branch:
+    - master
+    event:
+    - push
+    - promote
+    status:
+    - success
+    - failure
+
+services:
+- name: docker
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+
+- name: anchore-submission-server
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/anchore-submission:latest
+  commands:
+  - /run.sh server
+
+---
+kind: pipeline
+type: kubernetes
+name: matrix-5
+
+platform:
+  os: linux
+  arch: amd64
+
+steps:
+- name: synch_secrets
+  pull: if-not-exists
+  image: quay.io/ukhomeofficedigital/cop-secrets
+  environment:
+    AWS_ACCESS_KEY_ID:
+      from_secret: DEV_DRONE_AWS_ACCESS_KEY_ID
+    AWS_SECRET_ACCESS_KEY:
+      from_secret: DEV_DRONE_AWS_SECRET_ACCESS_KEY
+    DEPLOY_ENV: dev
+    DRONE_SERVER: https://drone-gh.acp.homeoffice.gov.uk
+    DRONE_TOKEN:
+      from_secret: DRONE_V1_PUBLIC_TOKEN
+    DRONE_VERSION: ${DRONE_SYSTEM_VERSION}
+  when:
+    event:
+    - promote
+    target:
+    - secrets
+
+- name: build_matrix
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+  commands:
+  - n=0; while [ "$n" -lt 60 ] && [ ! docker stats --no-stream ]; do n=$(( n + 1 )); sleep 1; done
+  - docker build -t cop-node:12-amazonlinux -f Dockerfile-amazonlinux-pdf --build-arg NODE_TAG=12 .
+  when:
+    event:
+    - push
+
+- name: vulnerability_scan_matrix
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/anchore-submission:latest
+  environment:
+    DOCKERFILE: Dockerfile-amazonlinux-pdf
+    IMAGE_NAME: cop-node:12-amazonlinux
+    LOCAL_IMAGE: true
+    TOLERATE: low
+    WHITELIST_FILE: whitelist
+  when:
+    branch:
+    - master
+    event:
+    - push
+
+- name: image_to_quay_matrix
+  image: plugins/docker
+  commands:
+  - docker build --rm=true -f Dockerfile-amazonlinux-pdf -t cop-node:12-amazonlinux --build-arg NODE_TAG=12 . --pull=true --label org.label-schema.schema-version=1.0 --label org.label-schema.build-date="$(date)" --label org.label-schema.vcs-ref=12-amazonlinux --label org.label-schema.vcs-url="https://github.com/UKHomeOffice/cop-node.git"
+  - docker tag cop-node:12-amazonlinux quay.io/ukhomeofficedigital/cop-node:12-amazonlinux
+  - echo $${DOCKER_PASSWORD} | docker login -u $${DOCKER_USERNAME} --password-stdin quay.io
+  - docker push quay.io/ukhomeofficedigital/cop-node:12-amazonlinux
+  - docker rmi cop-node:12-amazonlinux
+  environment:
+    DOCKER_PASSWORD:
+      from_secret: QUAY_PASSWORD
+    DOCKER_USERNAME:
+      from_secret: QUAY_USERNAME
+  volumes:
+  - name: dockersock
+    path: /var/run
+  when:
+    branch:
+    - master
+    event:
+    - push
+
+- name: notify
+  pull: if-not-exists
+  image: plugins/slack
+  settings:
+    channel: cop-deployments
+    template: "{{#build.deployTo}}\n  *{{repo.name}} - Build {{build.number}} - {{uppercasefirst build.deployTo}} - {{uppercase build.status}}*\n  {{build.link}}\n{{else}}\n  *{{repo.name}} - 12-amazonlinux - Build {{build.number}} - Development - {{uppercase build.status}}*\n  {{build.link}}\n{{/build.deployTo}}\n"
+    username: Drone Build Watcher
+  environment:
+    SLACK_WEBHOOK:
+      from_secret: SLACK_WEBHOOK
+  when:
+    branch:
+    - master
+    event:
+    - push
+    - promote
+    status:
+    - success
+    - failure
+
+services:
+- name: docker
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+
+- name: anchore-submission-server
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/anchore-submission:latest
+  commands:
+  - /run.sh server
+
+---
+kind: pipeline
+type: kubernetes
+name: matrix-6
+
+platform:
+  os: linux
+  arch: amd64
+
+steps:
+- name: build_matrix
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+  commands:
+  - n=0; while [ "$n" -lt 60 ] && [ ! docker stats --no-stream ]; do n=$(( n + 1 )); sleep 1; done
+  - docker build -t cop-node:13 -f Dockerfile-stretch --build-arg NODE_TAG=13 .
+  when:
+    event:
+    - push
+
+- name: vulnerability_scan_matrix
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/anchore-submission:latest
+  environment:
+    DOCKERFILE: Dockerfile-stretch
+    IMAGE_NAME: cop-node:13
+    LOCAL_IMAGE: true
+    TOLERATE: low
+    WHITELIST_FILE: whitelist
+  when:
+    branch:
+    - master
+    event:
+    - push
+
+- name: image_to_quay_matrix
+  image: plugins/docker
+  commands:
+  - docker build --rm=true -f Dockerfile-stretch -t cop-node:13 --build-arg NODE_TAG=13 . --pull=true --label org.label-schema.schema-version=1.0 --label org.label-schema.build-date="$(date)" --label org.label-schema.vcs-ref=13 --label org.label-schema.vcs-url="https://github.com/UKHomeOffice/cop-node.git"
+  - docker tag cop-node:13 quay.io/ukhomeofficedigital/cop-node:13
+  - echo $${DOCKER_PASSWORD} | docker login -u $${DOCKER_USERNAME} --password-stdin quay.io
+  - docker push quay.io/ukhomeofficedigital/cop-node:13
+  - docker rmi cop-node:13
+  environment:
+    DOCKER_PASSWORD:
+      from_secret: QUAY_PASSWORD
+    DOCKER_USERNAME:
+      from_secret: QUAY_USERNAME
+  volumes:
+  - name: dockersock
+    path: /var/run
+  when:
+    branch:
+    - master
+    event:
+    - push
+
+- name: notify
+  pull: if-not-exists
+  image: plugins/slack
+  settings:
+    channel: cop-deployments
+    template: "{{#build.deployTo}}\n  *{{repo.name}} - Build {{build.number}} - {{uppercasefirst build.deployTo}} - {{uppercase build.status}}*\n  {{build.link}}\n{{else}}\n  *{{repo.name}} - 13 - Build {{build.number}} - Development - {{uppercase build.status}}*\n  {{build.link}}\n{{/build.deployTo}}\n"
+    username: Drone Build Watcher
+  environment:
+    SLACK_WEBHOOK:
+      from_secret: SLACK_WEBHOOK
+  when:
+    branch:
+    - master
+    event:
+    - push
+    - promote
+    status:
+    - success
+    - failure
+
+services:
+- name: docker
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/dind
+
+- name: anchore-submission-server
+  pull: always
+  image: 340268328991.dkr.ecr.eu-west-2.amazonaws.com/acp/anchore-submission:latest
+  commands:
+  - /run.sh server
+
+...
